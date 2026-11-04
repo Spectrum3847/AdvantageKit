@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0">
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>org.littletonrobotics.akit</groupId>
+  <artifactId>akit-java</artifactId>
+  <version>27.0.0-alpha-7-spectrum.3</version>
+  <dependencies>
+
+  </dependencies>
+</project>
