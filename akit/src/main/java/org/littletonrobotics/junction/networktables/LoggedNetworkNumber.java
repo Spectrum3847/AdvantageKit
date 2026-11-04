@@ -78,12 +78,22 @@ public class LoggedNetworkNumber extends LoggedNetworkInput implements DoubleSup
 
   private final LoggableInputs inputs =
       new LoggableInputs() {
+        // The key without its leading slash, built once: these inputs are logged every cycle.
+        private String logKey;
+
+        private String logKey() {
+          if (logKey == null) {
+            logKey = removeSlash(key);
+          }
+          return logKey;
+        }
+
         public void toLog(LogTable table) {
-          table.put(removeSlash(key), value);
+          table.put(logKey(), value);
         }
 
         public void fromLog(LogTable table) {
-          value = table.get(removeSlash(key), defaultValue);
+          value = table.get(logKey(), defaultValue);
         }
       };
 

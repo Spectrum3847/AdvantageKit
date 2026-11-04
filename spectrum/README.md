@@ -15,6 +15,16 @@ Measured on a Raspberry Pi 5 (SystemCore's CPU) replaying an 8515 TXMAN1 match: 
 to 1.64 ms per loop, log receiver 0.52 to 0.16 ms, allocation 539 to 255 KB per loop, replayed
 outputs identical.
 
+Also on that branch, since `27.0.0-alpha-7-spectrum.4`: a `put` whose value equals the stored one
+returns before boxing the value or copying the array (struct puts compare the encoded bytes); a
+struct's schema is checked once per type, not on every put; `getSubtable` returns the same table
+each time, so `processInputs` builds no key or table per call; and the `LoggedNetwork*` inputs
+build their slash-less key once. The table ends up the same as before. Replaying the same match
+on a laptop: allocation 238 to 213 KB per loop, replayed outputs identical.
+
+Alerts are still read every cycle: WPILib keeps them in native code with no change counter, and
+reading them less often would log an alert late or miss a short one.
+
 ## Using it
 
 The fork is its own vendordep. In VS Code, "WPILib: Manage Vendor Libraries" > "Install new

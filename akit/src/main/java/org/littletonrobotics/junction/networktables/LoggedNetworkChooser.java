@@ -53,12 +53,22 @@ public class LoggedNetworkChooser<V> extends LoggedNetworkInput implements Suppl
 
   private final LoggableInputs inputs =
       new LoggableInputs() {
+        // The key without its leading slash, built once: these inputs are logged every cycle.
+        private String logKey;
+
+        private String logKey() {
+          if (logKey == null) {
+            logKey = removeSlash(key);
+          }
+          return logKey;
+        }
+
         public void toLog(LogTable table) {
-          table.put(removeSlash(key), selectedValue != null ? selectedValue : "");
+          table.put(logKey(), selectedValue != null ? selectedValue : "");
         }
 
         public void fromLog(LogTable table) {
-          selectedValue = table.get(removeSlash(key), defaultChoice);
+          selectedValue = table.get(logKey(), defaultChoice);
         }
       };
 

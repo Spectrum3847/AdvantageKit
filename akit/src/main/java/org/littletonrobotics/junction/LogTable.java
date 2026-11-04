@@ -45,6 +45,7 @@ public class LogTable {
   private final Map<String, Protobuf<?, ?>> protoTypeCache;
   private final Shared shared;
   private final Map<String, String> fullKeys;
+  private Map<String, LogTable> subtables;
 
   /**
    * State shared by a root table and its subtables: the entries changed since the last {@link
@@ -56,6 +57,12 @@ public class LogTable {
     Map<String, LogValue> changes;
 
     final Map<String, Map<String, String>> fullKeysByPrefix = new HashMap<>();
+
+    /** Struct types whose schemas (and nested schemas) are in the table. */
+    final Set<String> structSchemasWritten = new HashSet<>();
+
+    /** The array type string ("T[]") for each struct type string. */
+    final Map<String, String> structArrayTypes = new HashMap<>();
   }
 
   /** Timestamp wrapper to enable passing by reference to subtables. */
@@ -204,6 +211,35 @@ public class LogTable {
     return full;
   }
 
+  /**
+   * The value stored under a key, if it has this type, custom type and unit; otherwise null. A put
+   * returns early when the value it would store equals this one: the table would not change, and
+   * returning first saves boxing the value and copying the array, which every logged value paid
+   * every cycle whether or not it changed.
+   */
+  private LogValue stored(String key, LoggableType type, String customTypeStr, String unitStr) {
+    LogValue current = data.get(fullKey(key));
+    return current != null
+            && current.type == type
+            && Objects.equals(current.customTypeStr, customTypeStr)
+            && Objects.equals(current.unitStr, unitStr)
+        ? current
+        : null;
+  }
+
+  /** Whether the first {@code length} bytes of a buffer equal an array. */
+  private static boolean sameBytes(byte[] array, ByteBuffer buffer, int length) {
+    if (array.length != length) {
+      return false;
+    }
+    for (int i = 0; i < length; i++) {
+      if (array[i] != buffer.get(i)) {
+        return false;
+      }
+    }
+    return true;
+  }
+
   /** Stores a value under an absolute key and records the change. */
   private void store(String fullKey, LogValue value) {
     LogValue previous = data.put(fullKey, value);
@@ -238,7 +274,16 @@ public class LogTable {
    * @return The subtable object.
    */
   public LogTable getSubtable(String tableName) {
-    return new LogTable(prefix + tableName + "/", this);
+    // Logger.processInputs asks for the same subtables every cycle.
+    if (subtables == null) {
+      subtables = new HashMap<>();
+    }
+    LogTable subtable = subtables.get(tableName);
+    if (subtable == null) {
+      subtable = new LogTable(prefix + tableName + "/", this);
+      subtables.put(tableName, subtable);
+    }
+    return subtable;
   }
 
   /**
@@ -326,6 +371,8 @@ public class LogTable {
    */
   public void put(String key, byte[] value) {
     if (value == null) return;
+    LogValue current = stored(key, LoggableType.Raw, null, null);
+    if (current != null && Arrays.equals((byte[]) current.value, value)) return;
     byte[] valueClone = new byte[value.length];
     System.arraycopy(value, 0, valueClone, 0, value.length);
     put(key, new LogValue(valueClone, null));
@@ -352,6 +399,8 @@ public class LogTable {
    * @param value The field value.
    */
   public void put(String key, boolean value) {
+    LogValue current = stored(key, LoggableType.Boolean, null, null);
+    if (current != null && (boolean) current.value == value) return;
     put(key, new LogValue(value, null));
   }
 
@@ -364,6 +413,8 @@ public class LogTable {
    */
   public void put(String key, boolean[] value) {
     if (value == null) return;
+    LogValue current = stored(key, LoggableType.BooleanArray, null, null);
+    if (current != null && Arrays.equals((boolean[]) current.value, value)) return;
     boolean[] valueClone = new boolean[value.length];
     System.arraycopy(value, 0, valueClone, 0, value.length);
     put(key, new LogValue(valueClone, null));
@@ -432,6 +483,8 @@ public class LogTable {
    * @param value The field value.
    */
   public void put(String key, long value) {
+    LogValue current = stored(key, LoggableType.Integer, null, null);
+    if (current != null && (long) current.value == value) return;
     put(key, new LogValue(value, null));
   }
 
@@ -444,6 +497,8 @@ public class LogTable {
    */
   public void put(String key, long[] value) {
     if (value == null) return;
+    LogValue current = stored(key, LoggableType.IntegerArray, null, null);
+    if (current != null && Arrays.equals((long[]) current.value, value)) return;
     long[] valueClone = new long[value.length];
     System.arraycopy(value, 0, valueClone, 0, value.length);
     put(key, new LogValue(valueClone, null));
@@ -471,6 +526,11 @@ public class LogTable {
    * @param value The field value.
    */
   public void put(String key, float value) {
+    LogValue current = stored(key, LoggableType.Float, null, null);
+    if (current != null
+        && Float.floatToIntBits((float) current.value) == Float.floatToIntBits(value)) {
+      return;
+    }
     put(key, new LogValue(value, null));
   }
 
@@ -483,6 +543,11 @@ public class LogTable {
    * @param unit The unit to save as metadata.
    */
   public void put(String key, float value, String unit) {
+    LogValue current = stored(key, LoggableType.Float, null, unit);
+    if (current != null
+        && Float.floatToIntBits((float) current.value) == Float.floatToIntBits(value)) {
+      return;
+    }
     put(key, new LogValue(value, null, unit));
   }
 
@@ -495,6 +560,8 @@ public class LogTable {
    */
   public void put(String key, float[] value) {
     if (value == null) return;
+    LogValue current = stored(key, LoggableType.FloatArray, null, null);
+    if (current != null && Arrays.equals((float[]) current.value, value)) return;
     float[] valueClone = new float[value.length];
     System.arraycopy(value, 0, valueClone, 0, value.length);
     put(key, new LogValue(valueClone, null));
@@ -522,6 +589,11 @@ public class LogTable {
    * @param value The field value.
    */
   public void put(String key, double value) {
+    LogValue current = stored(key, LoggableType.Double, null, null);
+    if (current != null
+        && Double.doubleToLongBits((double) current.value) == Double.doubleToLongBits(value)) {
+      return;
+    }
     put(key, new LogValue(value, null));
   }
 
@@ -534,6 +606,11 @@ public class LogTable {
    * @param unit The unit to save as metadata.
    */
   public void put(String key, double value, String unit) {
+    LogValue current = stored(key, LoggableType.Double, null, unit);
+    if (current != null
+        && Double.doubleToLongBits((double) current.value) == Double.doubleToLongBits(value)) {
+      return;
+    }
     put(key, new LogValue(value, null, unit));
   }
 
@@ -546,6 +623,8 @@ public class LogTable {
    */
   public void put(String key, double[] value) {
     if (value == null) return;
+    LogValue current = stored(key, LoggableType.DoubleArray, null, null);
+    if (current != null && Arrays.equals((double[]) current.value, value)) return;
     double[] valueClone = new double[value.length];
     System.arraycopy(value, 0, valueClone, 0, value.length);
     put(key, new LogValue(valueClone, null));
@@ -574,6 +653,8 @@ public class LogTable {
    */
   public void put(String key, String value) {
     if (value == null) return;
+    LogValue current = stored(key, LoggableType.String, null, null);
+    if (current != null && value.equals(current.value)) return;
     put(key, new LogValue(value, null));
   }
 
@@ -586,6 +667,8 @@ public class LogTable {
    */
   public void put(String key, String[] value) {
     if (value == null) return;
+    LogValue current = stored(key, LoggableType.StringArray, null, null);
+    if (current != null && Arrays.equals((String[]) current.value, value)) return;
     String[] valueClone = new String[value.length];
     System.arraycopy(value, 0, valueClone, 0, value.length);
     put(key, new LogValue(valueClone, null));
@@ -729,16 +812,16 @@ public class LogTable {
   @SuppressWarnings("unchecked")
   public <T> void put(String key, Struct<T> struct, T value) {
     if (value == null) return;
-    addStructSchema(struct, new HashSet<>());
-    if (!structBuffers.containsKey(struct.getTypeString())) {
-      structBuffers.put(struct.getTypeString(), StructBuffer.create(struct));
-    }
-    StructBuffer<T> buffer = (StructBuffer<T>) structBuffers.get(struct.getTypeString());
-    ByteBuffer bb = buffer.write(value);
-    byte[] array = new byte[bb.position()];
+    String typeString = struct.getTypeString();
+    addStructSchema(struct);
+    ByteBuffer bb = structBuffer(struct).write(value);
+    int length = bb.position();
+    LogValue current = stored(key, LoggableType.Raw, typeString, null);
+    if (current != null && sameBytes((byte[]) current.value, bb, length)) return;
+    byte[] array = new byte[length];
     bb.position(0);
     bb.get(array);
-    put(key, new LogValue(array, struct.getTypeString()));
+    put(key, new LogValue(array, typeString));
   }
 
   /**
@@ -753,16 +836,36 @@ public class LogTable {
   @SuppressWarnings("unchecked")
   public <T> void put(String key, Struct<T> struct, T... value) {
     if (value == null) return;
-    addStructSchema(struct, new HashSet<>());
-    if (!structBuffers.containsKey(struct.getTypeString())) {
-      structBuffers.put(struct.getTypeString(), StructBuffer.create(struct));
-    }
-    StructBuffer<T> buffer = (StructBuffer<T>) structBuffers.get(struct.getTypeString());
-    ByteBuffer bb = buffer.writeArray(value);
-    byte[] array = new byte[bb.position()];
+    String typeString =
+        shared.structArrayTypes.computeIfAbsent(struct.getTypeString(), t -> t + "[]");
+    addStructSchema(struct);
+    ByteBuffer bb = structBuffer(struct).writeArray(value);
+    int length = bb.position();
+    LogValue current = stored(key, LoggableType.Raw, typeString, null);
+    if (current != null && sameBytes((byte[]) current.value, bb, length)) return;
+    byte[] array = new byte[length];
     bb.position(0);
     bb.get(array);
-    put(key, new LogValue(array, struct.getTypeString() + "[]"));
+    put(key, new LogValue(array, typeString));
+  }
+
+  @SuppressWarnings("unchecked")
+  private <T> StructBuffer<T> structBuffer(Struct<T> struct) {
+    StructBuffer<?> buffer = structBuffers.get(struct.getTypeString());
+    if (buffer == null) {
+      buffer = StructBuffer.create(struct);
+      structBuffers.put(struct.getTypeString(), buffer);
+    }
+    return (StructBuffer<T>) buffer;
+  }
+
+  /** Writes a struct type's schema and its nested schemas, once per table. */
+  private void addStructSchema(Struct<?> struct) {
+    if (shared.structSchemasWritten.contains(struct.getTypeString())) {
+      return;
+    }
+    addStructSchema(struct, new HashSet<>());
+    shared.structSchemasWritten.add(struct.getTypeString());
   }
 
   /**
