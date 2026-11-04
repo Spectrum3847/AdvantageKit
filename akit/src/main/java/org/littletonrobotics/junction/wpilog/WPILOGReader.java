@@ -8,8 +8,7 @@
 package org.littletonrobotics.junction.wpilog;
 
 import java.io.IOException;
-import java.util.HashMap;
-import java.util.Map;
+import java.util.Arrays;
 import org.littletonrobotics.junction.LogDataReceiver;
 import org.littletonrobotics.junction.LogReplaySource;
 import org.littletonrobotics.junction.LogTable;
@@ -29,10 +28,39 @@ public class WPILOGReader implements LogReplaySource {
   private DataLogIterator iterator;
 
   private Long timestamp;
-  private Map<Integer, String> entryIDs;
-  private Map<Integer, LoggableType> entryTypes;
-  private Map<Integer, String> entryCustomTypes;
-  private Map<Integer, String> entryUnits;
+
+  /**
+   * What a data record needs from its entry's start record, by entry id: worked out once per entry
+   * instead of with four boxed map lookups and a new key string per record.
+   */
+  private static final class Entry {
+    /** The table key: the entry name without its leading slash. */
+    final String key;
+
+    final boolean isTimestamp;
+
+    /** An old run's replay outputs, never read back. */
+    final boolean skip;
+
+    final LoggableType type;
+    final String customType;
+    String unit;
+
+    Entry(String name, LoggableType type, String customType, String unit) {
+      this.key = name.substring(1);
+      this.isTimestamp = name.equals(LogDataReceiver.timestampKey);
+      this.skip = key.startsWith("ReplayOutputs");
+      this.type = type;
+      this.customType = customType;
+      this.unit = unit;
+    }
+  }
+
+  private Entry[] entries;
+
+  private Entry entry(int id) {
+    return id >= 0 && id < entries.length ? entries[id] : null;
+  }
 
   /**
    * Creates a new WPILOGReader.
@@ -67,10 +95,7 @@ public class WPILOGReader implements LogReplaySource {
     // Create iterator and reset
     iterator = reader.iterator();
     timestamp = null;
-    entryIDs = new HashMap<>();
-    entryTypes = new HashMap<>();
-    entryCustomTypes = new HashMap<>();
-    entryUnits = new HashMap<>();
+    entries = new Entry[256];
   }
 
   private String parseUnit(String metadata) {
@@ -108,41 +133,40 @@ public class WPILOGReader implements LogReplaySource {
 
       if (record.isControl()) {
         if (record.isStart()) {
-          entryIDs.put(record.getStartData().entry, record.getStartData().name);
-          String typeStr = record.getStartData().type;
+          var start = record.getStartData();
+          String typeStr = start.type;
           var loggableType = LoggableType.fromWPILOGType(typeStr);
-          entryTypes.put(record.getStartData().entry, loggableType);
-          if ((loggableType == LoggableType.Raw && !typeStr.equals("raw"))
-              || typeStr.equals("json")) {
-            entryCustomTypes.put(record.getStartData().entry, typeStr);
-          }
+          String customType =
+              (loggableType == LoggableType.Raw && !typeStr.equals("raw")) || typeStr.equals("json")
+                  ? typeStr
+                  : null;
 
           // Parse and store the unit from the start record
-          String unit = parseUnit(record.getStartData().metadata);
-          if (unit != null) {
-            entryUnits.put(record.getStartData().entry, unit);
-          }
+          String unit = parseUnit(start.metadata);
 
           // Check timestamp unit
-          if (record.getStartData().name.equals(LogDataReceiver.timestampKey)) {
+          if (start.name.equals(LogDataReceiver.timestampKey)) {
             if (!"nanoseconds".equals(unit)) {
               throw new RuntimeException(
                   "[AdvantageKit] The replay log uses an incompatible timestamp unit. Logs must be recorded and replayed on the same version of AdvantageKit.");
             }
           }
+          if (start.entry >= entries.length) {
+            entries = Arrays.copyOf(entries, Math.max(start.entry + 1, entries.length * 2));
+          }
+          entries[start.entry] = new Entry(start.name, loggableType, customType, unit);
         } else if (record.isSetMetadata()) {
           // Handle metadata updates dynamically
-          String unit = parseUnit(record.getSetMetadataData().metadata);
-          if (unit != null) {
-            entryUnits.put(record.getSetMetadataData().entry, unit);
-          } else {
-            entryUnits.remove(record.getSetMetadataData().entry);
+          var metadata = record.getSetMetadataData();
+          Entry known = entry(metadata.entry);
+          if (known != null) {
+            known.unit = parseUnit(metadata.metadata);
           }
         }
       } else {
-        String entry = entryIDs.get(record.getEntry());
+        Entry entry = entry(record.getEntry());
         if (entry != null) {
-          if (entry.equals(LogDataReceiver.timestampKey)) {
+          if (entry.isTimestamp) {
             boolean firstTimestamp = timestamp == null;
             timestamp = record.getInteger();
             if (firstTimestamp) {
@@ -151,56 +175,52 @@ public class WPILOGReader implements LogReplaySource {
               break; // End of cycle
             }
 
-          } else if (timestamp != null) {
-            entry = entry.substring(1); // Remove leading slash
-            if (entry.startsWith("ReplayOutputs")) {
-              // Don't retrieve old replay outputs
-              continue;
-            }
-            String customType = entryCustomTypes.get(record.getEntry());
-            String unit = entryUnits.get(record.getEntry()); // NEW: Get the unit
+          } else if (timestamp != null && !entry.skip) {
+            String key = entry.key;
+            String customType = entry.customType;
+            String unit = entry.unit;
 
-            switch (entryTypes.get(record.getEntry())) {
+            switch (entry.type) {
               case Raw:
-                table.put(entry, new LogValue(record.getRaw(), customType));
+                table.put(key, new LogValue(record.getRaw(), customType));
                 break;
               case Boolean:
-                table.put(entry, new LogValue(record.getBoolean(), customType));
+                table.put(key, new LogValue(record.getBoolean(), customType));
                 break;
               case Integer:
-                table.put(entry, new LogValue(record.getInteger(), customType));
+                table.put(key, new LogValue(record.getInteger(), customType));
                 break;
               case Float:
                 if (unit != null) {
-                  table.put(entry, new LogValue(record.getFloat(), customType, unit));
+                  table.put(key, new LogValue(record.getFloat(), customType, unit));
                 } else {
-                  table.put(entry, new LogValue(record.getFloat(), customType));
+                  table.put(key, new LogValue(record.getFloat(), customType));
                 }
                 break;
               case Double:
                 if (unit != null) {
-                  table.put(entry, new LogValue(record.getDouble(), customType, unit));
+                  table.put(key, new LogValue(record.getDouble(), customType, unit));
                 } else {
-                  table.put(entry, new LogValue(record.getDouble(), customType));
+                  table.put(key, new LogValue(record.getDouble(), customType));
                 }
                 break;
               case String:
-                table.put(entry, new LogValue(record.getString(), customType));
+                table.put(key, new LogValue(record.getString(), customType));
                 break;
               case BooleanArray:
-                table.put(entry, new LogValue(record.getBooleanArray(), customType));
+                table.put(key, new LogValue(record.getBooleanArray(), customType));
                 break;
               case IntegerArray:
-                table.put(entry, new LogValue(record.getIntegerArray(), customType));
+                table.put(key, new LogValue(record.getIntegerArray(), customType));
                 break;
               case FloatArray:
-                table.put(entry, new LogValue(record.getFloatArray(), customType));
+                table.put(key, new LogValue(record.getFloatArray(), customType));
                 break;
               case DoubleArray:
-                table.put(entry, new LogValue(record.getDoubleArray(), customType));
+                table.put(key, new LogValue(record.getDoubleArray(), customType));
                 break;
               case StringArray:
-                table.put(entry, new LogValue(record.getStringArray(), customType));
+                table.put(key, new LogValue(record.getStringArray(), customType));
                 break;
             }
           }
