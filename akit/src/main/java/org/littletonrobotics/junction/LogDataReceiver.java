@@ -32,4 +32,18 @@ public interface LogDataReceiver {
    * @throws InterruptedException If interrupted while processing.
    */
   public void putTable(LogTable table) throws InterruptedException;
+
+  /**
+   * Called every loop cycle with the entries that changed, and the full table as of this cycle.
+   * Override it to do work in proportion to what changed; the default hands {@link #putTable} a
+   * copy of the full table.
+   *
+   * @param changes The entries changed this cycle, at this cycle's timestamp. Do not modify.
+   * @param current Every entry as of this cycle. Owned by the receiver thread and updated in place
+   *     next cycle: read it during the call, do not keep it or modify it.
+   * @throws InterruptedException If interrupted while processing.
+   */
+  public default void putChanges(LogTable changes, LogTable current) throws InterruptedException {
+    putTable(LogTable.clone(current));
+  }
 }

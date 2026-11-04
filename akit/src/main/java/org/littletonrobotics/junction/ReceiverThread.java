@@ -21,6 +21,9 @@ class ReceiverThread extends Thread {
   private Map<String, Double> traceTimes = new HashMap<>();
   private Map<String, Double> traceTimesLocal = new HashMap<>();
 
+  /** Every entry as of the last cycle, built from the changes the main thread sends. */
+  private final LogTable current = new LogTable(0);
+
   ReceiverThread(BlockingQueue<LogTable> queue) {
     super("AdvantageKit_LogReceiver");
     this.setDaemon(true);
@@ -62,7 +65,8 @@ class ReceiverThread extends Thread {
 
     try {
       while (true) {
-        LogTable entry = queue.take(); // Wait for data
+        LogTable changes = queue.take(); // Wait for data
+        current.applyChanges(changes);
 
         // Reset trace times
         traceTimesLocal.clear();
@@ -70,7 +74,7 @@ class ReceiverThread extends Thread {
         // Send data to receivers
         for (int i = 0; i < dataReceivers.size(); i++) {
           double startTime = Timer.getMonotonicTimestamp();
-          dataReceivers.get(i).putTable(entry);
+          dataReceivers.get(i).putChanges(changes, current);
           double endTime = Timer.getMonotonicTimestamp();
           traceTimesLocal.put(dataReceiverNames.get(i), (endTime - startTime) * 1000.0);
         }
@@ -85,10 +89,11 @@ class ReceiverThread extends Thread {
     } catch (InterruptedException exception) {
       // Empty queue
       while (!queue.isEmpty()) {
-        LogTable entry = queue.poll();
+        LogTable changes = queue.poll();
+        current.applyChanges(changes);
         for (int i = 0; i < dataReceivers.size(); i++) {
           try {
-            dataReceivers.get(i).putTable(entry);
+            dataReceivers.get(i).putChanges(changes, current);
           } catch (InterruptedException e) {
           }
         }

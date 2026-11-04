@@ -246,6 +246,9 @@ public class Logger {
         metadataTable.put(item.getKey(), item.getValue());
       }
 
+      // From here on only changed entries go to the receiver thread
+      entry.trackChanges();
+
       // Start receiver thread
       receiverThread.start();
 
@@ -430,18 +433,21 @@ public class Logger {
       // Record receiver thread data
       receiverThread.logOutputs();
 
+      // Send the entries changed this cycle to the receivers. The receiver thread keeps the full
+      // table; copying every entry each cycle cost time in proportion to everything ever logged.
+      LogTable changes = entry.takeChanges();
       try {
-        // Send a copy of the data to the receivers. The original object will be
-        // kept and updated with the next timestamp (and new data if replaying).
         if (hasReplaySource()) {
           // When in replay, block the thread if the queue is full to avoid dropping data
-          receiverQueue.put(LogTable.clone(entry));
+          receiverQueue.put(changes);
         } else {
           // When not in replay, drop data rather than blocking the main thread
-          receiverQueue.add(LogTable.clone(entry));
+          receiverQueue.add(changes);
         }
         receiverQueueFault = false;
       } catch (IllegalStateException exception) {
+        // This cycle is lost, but its changes go with the next one so no entry stays stale
+        entry.restoreChanges(changes);
         receiverQueueFault = true;
         lastReceiverQueueFault = Timer.getMonotonicTimestamp();
         DriverStationErrors.reportError(

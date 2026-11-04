@@ -283,6 +283,17 @@ public class WPILOGWriter implements LogDataReceiver {
     }
   }
 
+  @Override
+  public void putChanges(LogTable changes, LogTable current) {
+    // Until the file is open the full-table path queues copies, as before
+    if (waitingForMount) {
+      putTable(LogTable.clone(current));
+      return;
+    }
+    if (!isOpen) return;
+    putTableInternal(current, changes.getAll(false), null);
+  }
+
   public void putTable(LogTable table) {
     if (waitingForMount) {
       pendingTables.add(table);
@@ -293,7 +304,8 @@ public class WPILOGWriter implements LogDataReceiver {
           openLogFile();
           if (isOpen) {
             while (!pendingTables.isEmpty()) {
-              putTableInternal(pendingTables.poll());
+              LogTable pending = pendingTables.poll();
+              putTableInternal(pending, pending.getAll(false), lastTable.getAll(false));
             }
           } else {
             waitingForMount = false;
@@ -317,10 +329,18 @@ public class WPILOGWriter implements LogDataReceiver {
     // Exit if log not open
     if (!isOpen) return;
 
-    putTableInternal(table);
+    putTableInternal(table, table.getAll(false), lastTable.getAll(false));
   }
 
-  private void putTableInternal(LogTable table) {
+  /**
+   * Writes fields of a cycle.
+   *
+   * @param table The full table for this cycle (timestamp, and the fields the file name reads).
+   * @param newMap The fields to consider writing.
+   * @param oldMap Last cycle's fields, to skip unchanged ones; null when newMap holds only changes.
+   */
+  private void putTableInternal(
+      LogTable table, Map<String, LogValue> newMap, Map<String, LogValue> oldMap) {
     // Auto rename
     if (autoRename) {
 
@@ -430,10 +450,6 @@ public class WPILOGWriter implements LogDataReceiver {
     // Save timestamp
     log.appendInteger(timestampID, table.getTimestamp(), table.getTimestamp());
 
-    // Get new and old data
-    Map<String, LogValue> newMap = table.getAll(false);
-    Map<String, LogValue> oldMap = lastTable.getAll(false);
-
     // Encode fields
     for (Map.Entry<String, LogValue> field : newMap.entrySet()) {
 
@@ -455,7 +471,8 @@ public class WPILOGWriter implements LogDataReceiver {
           entryUnits.put(field.getKey(), unit);
         }
         appendData = true;
-      } else if (!field.getValue().equals(oldMap.get(field.getKey()))) { // Updated field
+      } else if (oldMap == null
+          || !field.getValue().equals(oldMap.get(field.getKey()))) { // Updated field
         appendData = true;
       }
 
@@ -523,7 +540,10 @@ public class WPILOGWriter implements LogDataReceiver {
     }
 
     // Update last table
-    lastTable = table;
+    // The current table is updated in place, so only a full table can be kept for comparing
+    if (oldMap != null) {
+      lastTable = table;
+    }
   }
 
   /**

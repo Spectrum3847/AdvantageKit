@@ -34,19 +34,32 @@ public class NT4Publisher implements LogDataReceiver {
                 PubSubOption.SEND_ALL);
   }
 
+  @Override
+  public void putChanges(LogTable changes, LogTable current) {
+    publish(changes, changes.getAll(false), null);
+  }
+
   public void putTable(LogTable table) {
+    publish(table, table.getAll(false), lastTable.getAll(false));
+    lastTable = table;
+  }
+
+  /**
+   * Publishes fields of a cycle.
+   *
+   * @param table The table for this cycle's timestamp.
+   * @param newMap The fields to consider publishing.
+   * @param oldMap Last cycle's fields, to skip unchanged ones; null when newMap holds only changes.
+   */
+  private void publish(LogTable table, Map<String, LogValue> newMap, Map<String, LogValue> oldMap) {
     // Send timestamp
     timestampPublisher.set(table.getTimestamp(), table.getTimestamp());
-
-    // Get old and new data
-    Map<String, LogValue> newMap = table.getAll(false);
-    Map<String, LogValue> oldMap = lastTable.getAll(false);
 
     // Encode new/changed fields
     for (Map.Entry<String, LogValue> field : newMap.entrySet()) {
       // Check if field has changed
       LogValue newValue = field.getValue();
-      if (newValue.equals(oldMap.get(field.getKey()))) {
+      if (oldMap != null && newValue.equals(oldMap.get(field.getKey()))) {
         continue;
       }
 
@@ -114,8 +127,5 @@ public class NT4Publisher implements LogDataReceiver {
           break;
       }
     }
-
-    // Update last table
-    lastTable = table;
   }
 }

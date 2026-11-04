@@ -43,6 +43,20 @@ public class LogTable {
   private final Map<String, ProtobufBuffer<?, ?>> protoBuffers;
   private final Map<String, Struct<?>> structTypeCache;
   private final Map<String, Protobuf<?, ?>> protoTypeCache;
+  private final Shared shared;
+  private final Map<String, String> fullKeys;
+
+  /**
+   * State shared by a root table and its subtables: the entries changed since the last {@link
+   * #takeChanges()}, and the full key for each (prefix, key) pair so a put does not build a new
+   * string. Only the thread that writes the table touches it.
+   */
+  private static class Shared {
+    /** Changed entries by full key, or null while changes are not tracked. */
+    Map<String, LogValue> changes;
+
+    final Map<String, Map<String, String>> fullKeysByPrefix = new HashMap<>();
+  }
 
   /** Timestamp wrapper to enable passing by reference to subtables. */
   private static class SharedTimestamp {
@@ -62,7 +76,8 @@ public class LogTable {
       Map<String, StructBuffer<?>> structBuffers,
       Map<String, ProtobufBuffer<?, ?>> protoBuffers,
       Map<String, Struct<?>> structTypeCache,
-      Map<String, Protobuf<?, ?>> protoTypeCache) {
+      Map<String, Protobuf<?, ?>> protoTypeCache,
+      Shared shared) {
     this.prefix = prefix;
     this.depth = depth;
     this.timestamp = timestamp;
@@ -71,6 +86,8 @@ public class LogTable {
     this.protoBuffers = protoBuffers;
     this.structTypeCache = structTypeCache;
     this.protoTypeCache = protoTypeCache;
+    this.shared = shared;
+    this.fullKeys = shared.fullKeysByPrefix.computeIfAbsent(prefix, p -> new HashMap<>());
   }
 
   /**
@@ -87,7 +104,8 @@ public class LogTable {
         new HashMap<>(),
         new HashMap<>(),
         new HashMap<>(),
-        new HashMap<>());
+        new HashMap<>(),
+        new Shared());
   }
 
   /**
@@ -105,7 +123,8 @@ public class LogTable {
         parent.structBuffers,
         parent.protoBuffers,
         parent.structTypeCache,
-        parent.protoTypeCache);
+        parent.protoTypeCache,
+        parent.shared);
   }
 
   /**
@@ -126,7 +145,71 @@ public class LogTable {
         new HashMap<>(),
         new HashMap<>(),
         new HashMap<>(),
-        new HashMap<>());
+        new HashMap<>(),
+        new Shared());
+  }
+
+  /**
+   * Starts recording which entries change, for {@link #takeChanges()}. Every entry already in the
+   * table counts as changed.
+   */
+  void trackChanges() {
+    if (shared.changes == null) {
+      shared.changes = new HashMap<>(data);
+    }
+  }
+
+  /**
+   * Returns a new root table holding only the entries changed since the last call (or since {@link
+   * #trackChanges()}), at this table's timestamp, and starts a new set of changes.
+   */
+  LogTable takeChanges() {
+    Map<String, LogValue> changed = shared.changes;
+    shared.changes = new HashMap<>(Math.max(16, changed.size() * 2));
+    return new LogTable(
+        "/",
+        0,
+        new SharedTimestamp(timestamp.value),
+        changed,
+        new HashMap<>(),
+        new HashMap<>(),
+        new HashMap<>(),
+        new HashMap<>(),
+        new Shared());
+  }
+
+  /**
+   * Puts back changes that could not be delivered, so the next {@link #takeChanges()} carries them.
+   * A value changed again since then is newer and wins.
+   */
+  void restoreChanges(LogTable undelivered) {
+    for (Map.Entry<String, LogValue> e : undelivered.data.entrySet()) {
+      shared.changes.putIfAbsent(e.getKey(), e.getValue());
+    }
+  }
+
+  /** Applies a table of changes to this one and takes its timestamp. */
+  void applyChanges(LogTable changes) {
+    timestamp.value = changes.timestamp.value;
+    data.putAll(changes.data);
+  }
+
+  /** The absolute key for a key in this table, without building a new string each time. */
+  private String fullKey(String key) {
+    String full = fullKeys.get(key);
+    if (full == null) {
+      full = prefix + key;
+      fullKeys.put(key, full);
+    }
+    return full;
+  }
+
+  /** Stores a value under an absolute key and records the change. */
+  private void store(String fullKey, LogValue value) {
+    LogValue previous = data.put(fullKey, value);
+    if (shared.changes != null && !value.equals(previous)) {
+      shared.changes.put(fullKey, value);
+    }
   }
 
   /**
@@ -185,7 +268,11 @@ public class LogTable {
    * the correct type). Sends a warning to the Driver Station if the existing type is different.
    */
   private boolean writeAllowed(String key, LoggableType type, String customTypeStr) {
-    LogValue currentValue = data.get(prefix + key);
+    return writeAllowed(key, data.get(fullKey(key)), type, customTypeStr);
+  }
+
+  private boolean writeAllowed(
+      String key, LogValue currentValue, LoggableType type, String customTypeStr) {
     if (currentValue == null) {
       return true;
     }
@@ -225,8 +312,9 @@ public class LogTable {
    */
   public void put(String key, LogValue value) {
     if (value == null) return;
-    if (writeAllowed(key, value.type, value.customTypeStr)) {
-      data.put(prefix + key, value);
+    String full = fullKey(key);
+    if (writeAllowed(key, data.get(full), value.type, value.customTypeStr)) {
+      store(full, value);
     }
   }
 
@@ -620,7 +708,7 @@ public class LogTable {
       throw new UnsupportedOperationException(typeString + ": circular reference with " + seen);
     }
     try {
-      data.put(key, new LogValue(struct.getSchema().getBytes("UTF-8"), "structschema"));
+      store(key, new LogValue(struct.getSchema().getBytes("UTF-8"), "structschema"));
     } catch (UnsupportedEncodingException e) {
       e.printStackTrace();
     }
@@ -711,7 +799,7 @@ public class LogTable {
     proto.forEachDescriptor(
         (name) -> data.containsKey("/.schema/" + name),
         (typeString, schema) ->
-            data.put("/.schema/" + typeString, new LogValue(schema, "proto:FileDescriptorProto")));
+            store("/.schema/" + typeString, new LogValue(schema, "proto:FileDescriptorProto")));
     if (!protoBuffers.containsKey(proto.getTypeString())) {
       protoBuffers.put(proto.getTypeString(), ProtobufBuffer.create(proto));
     }
@@ -902,7 +990,7 @@ public class LogTable {
    * @return The field value.
    */
   public LogValue get(String key) {
-    return data.get(prefix + key);
+    return data.get(fullKey(key));
   }
 
   /**
@@ -913,7 +1001,7 @@ public class LogTable {
    * @return The field value.
    */
   public byte[] get(String key, byte[] defaultValue) {
-    if (data.containsKey(prefix + key)) {
+    if (data.containsKey(fullKey(key))) {
       return get(key).getRaw(defaultValue);
     } else {
       return defaultValue;
@@ -928,7 +1016,7 @@ public class LogTable {
    * @return The field value.
    */
   public byte[][] get(String key, byte[][] defaultValue) {
-    if (data.containsKey(prefix + key + "/length")) {
+    if (data.containsKey(fullKey(key) + "/length")) {
       byte[][] value = new byte[get(key + "/length", 0)][];
       for (int i = 0; i < value.length; i++) {
         value[i] = get(key + "/" + Integer.toString(i), new byte[0]);
@@ -947,7 +1035,7 @@ public class LogTable {
    * @return The field value.
    */
   public boolean get(String key, boolean defaultValue) {
-    if (data.containsKey(prefix + key)) {
+    if (data.containsKey(fullKey(key))) {
       return get(key).getBoolean(defaultValue);
     } else {
       return defaultValue;
@@ -962,7 +1050,7 @@ public class LogTable {
    * @return The field value.
    */
   public boolean[] get(String key, boolean[] defaultValue) {
-    if (data.containsKey(prefix + key)) {
+    if (data.containsKey(fullKey(key))) {
       return get(key).getBooleanArray(defaultValue);
     } else {
       return defaultValue;
@@ -977,7 +1065,7 @@ public class LogTable {
    * @return The field value.
    */
   public boolean[][] get(String key, boolean[][] defaultValue) {
-    if (data.containsKey(prefix + key + "/length")) {
+    if (data.containsKey(fullKey(key) + "/length")) {
       boolean[][] value = new boolean[get(key + "/length", 0)][];
       for (int i = 0; i < value.length; i++) {
         value[i] = get(key + "/" + Integer.toString(i), new boolean[0]);
@@ -996,7 +1084,7 @@ public class LogTable {
    * @return The field value.
    */
   public int get(String key, int defaultValue) {
-    if (data.containsKey(prefix + key)) {
+    if (data.containsKey(fullKey(key))) {
       return (int) get(key).getInteger(defaultValue);
     } else {
       return defaultValue;
@@ -1011,7 +1099,7 @@ public class LogTable {
    * @return The field value.
    */
   public int[] get(String key, int[] defaultValue) {
-    if (data.containsKey(prefix + key)) {
+    if (data.containsKey(fullKey(key))) {
       long[] defaultValueLong = new long[defaultValue.length];
       for (int i = 0; i < defaultValue.length; i++) {
         defaultValueLong[i] = defaultValue[i];
@@ -1035,7 +1123,7 @@ public class LogTable {
    * @return The field value.
    */
   public int[][] get(String key, int[][] defaultValue) {
-    if (data.containsKey(prefix + key + "/length")) {
+    if (data.containsKey(fullKey(key) + "/length")) {
       int[][] value = new int[get(key + "/length", 0)][];
       for (int i = 0; i < value.length; i++) {
         value[i] = get(key + "/" + Integer.toString(i), new int[0]);
@@ -1054,7 +1142,7 @@ public class LogTable {
    * @return The field value.
    */
   public long get(String key, long defaultValue) {
-    if (data.containsKey(prefix + key)) {
+    if (data.containsKey(fullKey(key))) {
       return get(key).getInteger(defaultValue);
     } else {
       return defaultValue;
@@ -1069,7 +1157,7 @@ public class LogTable {
    * @return The field value.
    */
   public long[] get(String key, long[] defaultValue) {
-    if (data.containsKey(prefix + key)) {
+    if (data.containsKey(fullKey(key))) {
       return get(key).getIntegerArray(defaultValue);
     } else {
       return defaultValue;
@@ -1084,7 +1172,7 @@ public class LogTable {
    * @return The field value.
    */
   public long[][] get(String key, long[][] defaultValue) {
-    if (data.containsKey(prefix + key + "/length")) {
+    if (data.containsKey(fullKey(key) + "/length")) {
       long[][] value = new long[get(key + "/length", 0)][];
       for (int i = 0; i < value.length; i++) {
         value[i] = get(key + "/" + Integer.toString(i), new long[0]);
@@ -1103,7 +1191,7 @@ public class LogTable {
    * @return The field value.
    */
   public float get(String key, float defaultValue) {
-    if (data.containsKey(prefix + key)) {
+    if (data.containsKey(fullKey(key))) {
       return get(key).getFloat(defaultValue);
     } else {
       return defaultValue;
@@ -1118,7 +1206,7 @@ public class LogTable {
    * @return The field value.
    */
   public float[] get(String key, float[] defaultValue) {
-    if (data.containsKey(prefix + key)) {
+    if (data.containsKey(fullKey(key))) {
       return get(key).getFloatArray(defaultValue);
     } else {
       return defaultValue;
@@ -1133,7 +1221,7 @@ public class LogTable {
    * @return The field value.
    */
   public float[][] get(String key, float[][] defaultValue) {
-    if (data.containsKey(prefix + key + "/length")) {
+    if (data.containsKey(fullKey(key) + "/length")) {
       float[][] value = new float[get(key + "/length", 0)][];
       for (int i = 0; i < value.length; i++) {
         value[i] = get(key + "/" + Integer.toString(i), new float[0]);
@@ -1152,7 +1240,7 @@ public class LogTable {
    * @return The field value.
    */
   public double get(String key, double defaultValue) {
-    if (data.containsKey(prefix + key)) {
+    if (data.containsKey(fullKey(key))) {
       return get(key).getDouble(defaultValue);
     } else {
       return defaultValue;
@@ -1167,7 +1255,7 @@ public class LogTable {
    * @return The field value.
    */
   public double[] get(String key, double[] defaultValue) {
-    if (data.containsKey(prefix + key)) {
+    if (data.containsKey(fullKey(key))) {
       return get(key).getDoubleArray(defaultValue);
     } else {
       return defaultValue;
@@ -1182,7 +1270,7 @@ public class LogTable {
    * @return The field value.
    */
   public double[][] get(String key, double[][] defaultValue) {
-    if (data.containsKey(prefix + key + "/length")) {
+    if (data.containsKey(fullKey(key) + "/length")) {
       double[][] value = new double[get(key + "/length", 0)][];
       for (int i = 0; i < value.length; i++) {
         value[i] = get(key + "/" + Integer.toString(i), new double[0]);
@@ -1201,7 +1289,7 @@ public class LogTable {
    * @return The field value.
    */
   public String get(String key, String defaultValue) {
-    if (data.containsKey(prefix + key)) {
+    if (data.containsKey(fullKey(key))) {
       return get(key).getString(defaultValue);
     } else {
       return defaultValue;
@@ -1216,7 +1304,7 @@ public class LogTable {
    * @return The field value.
    */
   public String[] get(String key, String[] defaultValue) {
-    if (data.containsKey(prefix + key)) {
+    if (data.containsKey(fullKey(key))) {
       return get(key).getStringArray(defaultValue);
     } else {
       return defaultValue;
@@ -1231,7 +1319,7 @@ public class LogTable {
    * @return The field value.
    */
   public String[][] get(String key, String[][] defaultValue) {
-    if (data.containsKey(prefix + key + "/length")) {
+    if (data.containsKey(fullKey(key) + "/length")) {
       String[][] value = new String[get(key + "/length", 0)][];
       for (int i = 0; i < value.length; i++) {
         value[i] = get(key + "/" + Integer.toString(i), new String[0]);
@@ -1252,7 +1340,7 @@ public class LogTable {
    */
   @SuppressWarnings("unchecked")
   public <E extends Enum<E>> E get(String key, E defaultValue) {
-    if (data.containsKey(prefix + key)) {
+    if (data.containsKey(fullKey(key))) {
       String name = get(key).getString(defaultValue.name());
       return (E) Enum.valueOf(defaultValue.getClass(), name);
     } else {
@@ -1270,7 +1358,7 @@ public class LogTable {
    */
   @SuppressWarnings({"unchecked", "rawtypes"})
   public <E extends Enum<E>> E[] get(String key, E[] defaultValue) {
-    if (data.containsKey(prefix + key)) {
+    if (data.containsKey(fullKey(key))) {
       String[] names = get(key).getStringArray(null);
       if (names == null) return defaultValue;
       Class<? extends Enum> enumClass =
@@ -1295,7 +1383,7 @@ public class LogTable {
    */
   @SuppressWarnings("unchecked")
   public <E extends Enum<E>> E[][] get(String key, E[][] defaultValue) {
-    if (data.containsKey(prefix + key + "/length")) {
+    if (data.containsKey(fullKey(key) + "/length")) {
       int length = get(key + "/length", 0);
       E[][] value = (E[][]) Array.newInstance(defaultValue.getClass().getComponentType(), length);
       for (int i = 0; i < length; i++) {
@@ -1321,7 +1409,7 @@ public class LogTable {
    */
   @SuppressWarnings("unchecked")
   public <U extends Unit, M extends Measure<U>> M getMeasure(String key, M defaultValue) {
-    if (data.containsKey(prefix + key)) {
+    if (data.containsKey(fullKey(key))) {
       double value = get(key).getDouble(defaultValue.baseUnitMagnitude());
       return (M) defaultValue.unit().ofBaseUnits(value);
     } else {
@@ -1337,7 +1425,7 @@ public class LogTable {
    * @return The field value.
    */
   public Color get(String key, Color defaultValue) {
-    if (data.containsKey(prefix + key)) {
+    if (data.containsKey(fullKey(key))) {
       return new Color(new Color8Bit(get(key).getString(defaultValue.toHexString())));
     } else {
       return defaultValue;
@@ -1369,7 +1457,7 @@ public class LogTable {
    */
   @SuppressWarnings("unchecked")
   public <T> T get(String key, Struct<T> struct, T defaultValue) {
-    if (data.containsKey(prefix + key)) {
+    if (data.containsKey(fullKey(key))) {
       if (!structBuffers.containsKey(struct.getTypeString())) {
         structBuffers.put(struct.getTypeString(), StructBuffer.create(struct));
       }
@@ -1391,7 +1479,7 @@ public class LogTable {
    */
   @SuppressWarnings("unchecked")
   public <T> T[] get(String key, Struct<T> struct, T... defaultValue) {
-    if (data.containsKey(prefix + key)) {
+    if (data.containsKey(fullKey(key))) {
       if (!structBuffers.containsKey(struct.getTypeString())) {
         structBuffers.put(struct.getTypeString(), StructBuffer.create(struct));
       }
@@ -1413,7 +1501,7 @@ public class LogTable {
    */
   @SuppressWarnings("unchecked")
   public <T> T[][] get(String key, Struct<T> struct, T[][] defaultValue) {
-    if (data.containsKey(prefix + key + "/length")) {
+    if (data.containsKey(fullKey(key) + "/length")) {
       int length = get(key + "/length", 0);
       T[][] value = (T[][]) Array.newInstance(defaultValue.getClass().getComponentType(), length);
       for (int i = 0; i < length; i++) {
@@ -1441,7 +1529,7 @@ public class LogTable {
   @SuppressWarnings("unchecked")
   public <T, MessageType extends ProtoMessage<?>> T get(
       String key, Protobuf<T, MessageType> proto, T defaultValue) {
-    if (data.containsKey(prefix + key)) {
+    if (data.containsKey(fullKey(key))) {
       if (!protoBuffers.containsKey(proto.getTypeString())) {
         protoBuffers.put(proto.getTypeString(), ProtobufBuffer.create(proto));
       }
@@ -1468,8 +1556,8 @@ public class LogTable {
    */
   @SuppressWarnings("unchecked")
   public <T extends WPISerializable> T get(String key, T defaultValue) {
-    if (data.containsKey(prefix + key)) {
-      String typeString = data.get(prefix + key).customTypeStr;
+    if (data.containsKey(fullKey(key))) {
+      String typeString = data.get(fullKey(key)).customTypeStr;
       if (typeString.startsWith("struct:")) {
         Struct<T> struct = (Struct<T>) findStructType(defaultValue.getClass());
         if (struct != null) {
@@ -1496,8 +1584,8 @@ public class LogTable {
    */
   @SuppressWarnings("unchecked")
   public <T extends StructSerializable> T[] get(String key, T... defaultValue) {
-    if (data.containsKey(prefix + key)) {
-      String typeString = data.get(prefix + key).customTypeStr;
+    if (data.containsKey(fullKey(key))) {
+      String typeString = data.get(fullKey(key)).customTypeStr;
       if (typeString.startsWith("struct:")) {
         Struct<T> struct = (Struct<T>) findStructType(defaultValue.getClass().getComponentType());
         if (struct != null) {
@@ -1518,7 +1606,7 @@ public class LogTable {
    */
   @SuppressWarnings("unchecked")
   public <T extends StructSerializable> T[][] get(String key, T[][] defaultValue) {
-    if (data.containsKey(prefix + key + "/length")) {
+    if (data.containsKey(fullKey(key) + "/length")) {
       int length = get(key + "/length", 0);
       T[][] value = (T[][]) Array.newInstance(defaultValue.getClass().getComponentType(), length);
       for (int i = 0; i < length; i++) {
@@ -1546,8 +1634,8 @@ public class LogTable {
     if (defaultValue instanceof Measure<?> measure) {
       return (R) getMeasure(key, (Measure<?>) measure);
     }
-    if (data.containsKey(prefix + key)) {
-      String typeString = data.get(prefix + key).customTypeStr;
+    if (data.containsKey(fullKey(key))) {
+      String typeString = data.get(fullKey(key)).customTypeStr;
       if (typeString.startsWith("struct:")) {
         Struct<R> struct = (Struct<R>) findRecordStructType(defaultValue.getClass());
         if (struct != null) {
@@ -1568,8 +1656,8 @@ public class LogTable {
    */
   @SuppressWarnings("unchecked")
   public <R extends Record> R[] get(String key, R... defaultValue) {
-    if (data.containsKey(prefix + key)) {
-      String typeString = data.get(prefix + key).customTypeStr;
+    if (data.containsKey(fullKey(key))) {
+      String typeString = data.get(fullKey(key)).customTypeStr;
       if (typeString.startsWith("struct:")) {
         Struct<R> struct =
             (Struct<R>) findRecordStructType(defaultValue.getClass().getComponentType());
@@ -1591,7 +1679,7 @@ public class LogTable {
    */
   @SuppressWarnings("unchecked")
   public <R extends Record> R[][] get(String key, R[][] defaultValue) {
-    if (data.containsKey(prefix + key + "/length")) {
+    if (data.containsKey(fullKey(key) + "/length")) {
       int length = get(key + "/length", 0);
       R[][] value = (R[][]) Array.newInstance(defaultValue.getClass().getComponentType(), length);
       for (int i = 0; i < length; i++) {
