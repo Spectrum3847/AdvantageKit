@@ -39,7 +39,13 @@ else
     touch "$site/.nojekyll"
 fi
 
-publish() { # artifactId jar
+# The runtime dependencies a module's build file declares, as POM <dependency> elements, so a
+# consumer gets them as it would from upstream (autolog needs JavaPoet).
+pom_dependencies() { # build.gradle.kts
+    grep -oE 'implementation\("[^"]+"\)' "$1" | sed -E 's/implementation\("([^:]+):([^:]+):([^"]+)"\)/      <dependency><groupId>\1<\/groupId><artifactId>\2<\/artifactId><version>\3<\/version><scope>runtime<\/scope><\/dependency>/'
+}
+
+publish() { # artifactId jar [build.gradle.kts whose implementation dependencies the POM lists]
     local dir=$site/org/littletonrobotics/akit/$1/$version
     if [ -e "$dir" ]; then
         echo "$1 $version is already published" >&2
@@ -47,6 +53,10 @@ publish() { # artifactId jar
     fi
     mkdir -p "$dir"
     cp "$2" "$dir/$1-$version.jar"
+    local deps=""
+    if [ -n "${3:-}" ]; then
+        deps=$(pom_dependencies "$3")
+    fi
     cat > "$dir/$1-$version.pom" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <project xmlns="http://maven.apache.org/POM/4.0.0">
@@ -54,6 +64,9 @@ publish() { # artifactId jar
   <groupId>org.littletonrobotics.akit</groupId>
   <artifactId>$1</artifactId>
   <version>$version</version>
+  <dependencies>
+$deps
+  </dependencies>
 </project>
 EOF
     for f in "$dir"/*; do
@@ -62,7 +75,7 @@ EOF
     done
 }
 publish akit-java akit/build/libs/akit.jar
-publish akit-autolog akit/autolog/build/libs/autolog.jar
+publish akit-autolog akit/autolog/build/libs/autolog.jar akit/autolog/build.gradle.kts
 
 # The vendordep: latest at the root (its jsonUrl), and a copy per version.
 sed -e "s/\$VERSION/$version/g" -e "s/\$UPSTREAM_VERSION/$upstream_version/g" \
