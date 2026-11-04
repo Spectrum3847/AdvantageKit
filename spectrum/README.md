@@ -22,6 +22,10 @@ each time, so `processInputs` builds no key or table per call; and the `LoggedNe
 build their slash-less key once. The table ends up the same as before. Replaying the same match
 on a laptop: allocation 238 to 213 KB per loop, replayed outputs identical.
 
+Since `spectrum.5`, the replay reader works out each entry's key, type and unit once, when the
+entry starts, instead of boxing its id for four map lookups and building a new key string for
+every record: replay allocation 214 to 200 KB per loop, outputs identical.
+
 Alerts are still read every cycle: WPILib keeps them in native code with no change counter, and
 reading them less often would log an alert late or miss a short one.
 
