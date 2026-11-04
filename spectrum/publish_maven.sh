@@ -1,22 +1,25 @@
 #!/usr/bin/env bash
-# Publishes this fork's akit-java to the Maven repository on the fork's GitHub Pages
-# (https://spectrum3847.github.io/AdvantageKit/), served from the orphan `maven` branch.
+# Publishes this fork to the Maven repository on the fork's GitHub Pages
+# (https://spectrum3847.github.io/AdvantageKit/), served from the orphan `maven` branch:
+# akit-java and akit-autolog, plus the vendordep AdvantageKit-Spectrum.json at the site root, which
+# is the vendordep's jsonUrl, so WPILib's "update vendordeps" updates to the fork, not upstream.
 #
-#   spectrum/publish_maven.sh 27.0.0-alpha-7-spectrum.1
+#   spectrum/publish_maven.sh 27.0.0-alpha-7-spectrum.2
 #
-# Only akit-java is published. Robot projects keep upstream's akit-wpilibio (native) and
-# akit-autolog at the upstream version, so the fork must not change the JNI or the annotations.
+# The native akit-wpilibio is not rebuilt: the vendordep takes upstream's, at the upstream version
+# the fork version starts with, so the fork must not change the JNI.
 # A published version is never overwritten: bump the last number instead.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-version=${1:?usage: spectrum/publish_maven.sh VERSION (e.g. 27.0.0-alpha-7-spectrum.1)}
+version=${1:?usage: spectrum/publish_maven.sh VERSION (e.g. 27.0.0-alpha-7-spectrum.2)}
 case $version in
     *-spectrum.*) ;;
     *) echo "version must end in -spectrum.N so it never collides with upstream" >&2; exit 1 ;;
 esac
-if [ -n "$(git status --porcelain akit)" ]; then
-    echo "akit/ has uncommitted changes; publish from a commit" >&2
+upstream_version=${version%-spectrum.*}
+if [ -n "$(git status --porcelain akit spectrum)" ]; then
+    echo "akit/ or spectrum/ has uncommitted changes; publish from a commit" >&2
     exit 1
 fi
 
@@ -36,28 +39,39 @@ else
     touch "$site/.nojekyll"
 fi
 
-dir=$site/org/littletonrobotics/akit/akit-java/$version
-if [ -e "$dir" ]; then
-    echo "$version is already published" >&2
-    exit 1
-fi
-mkdir -p "$dir"
-cp akit/build/libs/akit.jar "$dir/akit-java-$version.jar"
-cat > "$dir/akit-java-$version.pom" <<EOF
+publish() { # artifactId jar
+    local dir=$site/org/littletonrobotics/akit/$1/$version
+    if [ -e "$dir" ]; then
+        echo "$1 $version is already published" >&2
+        exit 1
+    fi
+    mkdir -p "$dir"
+    cp "$2" "$dir/$1-$version.jar"
+    cat > "$dir/$1-$version.pom" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <project xmlns="http://maven.apache.org/POM/4.0.0">
   <modelVersion>4.0.0</modelVersion>
   <groupId>org.littletonrobotics.akit</groupId>
-  <artifactId>akit-java</artifactId>
+  <artifactId>$1</artifactId>
   <version>$version</version>
 </project>
 EOF
-for f in "$dir"/*; do
-    sha1sum "$f" | cut -d' ' -f1 > "$f.sha1"
-    sha256sum "$f" | cut -d' ' -f1 > "$f.sha256"
-done
+    for f in "$dir"/*; do
+        sha1sum "$f" | cut -d' ' -f1 > "$f.sha1"
+        sha256sum "$f" | cut -d' ' -f1 > "$f.sha256"
+    done
+}
+publish akit-java akit/build/libs/akit.jar
+publish akit-autolog akit/autolog/build/libs/autolog.jar
+
+# The vendordep: latest at the root (its jsonUrl), and a copy per version.
+sed -e "s/\$VERSION/$version/g" -e "s/\$UPSTREAM_VERSION/$upstream_version/g" \
+    spectrum/AdvantageKit-Spectrum.json > "$site/AdvantageKit-Spectrum.json"
+mkdir -p "$site/vendordeps"
+cp "$site/AdvantageKit-Spectrum.json" "$site/vendordeps/AdvantageKit-Spectrum-$version.json"
+"$(command -v python3 || command -v python)" -m json.tool "$site/AdvantageKit-Spectrum.json" > /dev/null
 
 git -C "$site" add -A
-git -C "$site" commit -q -m "akit-java $version from $(git rev-parse --short HEAD)"
+git -C "$site" commit -q -m "AdvantageKit $version from $(git rev-parse --short HEAD)"
 git -C "$site" push -q origin maven
-echo "published akit-java $version"
+echo "published AdvantageKit $version"

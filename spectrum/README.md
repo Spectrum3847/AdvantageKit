@@ -17,25 +17,27 @@ outputs identical.
 
 ## Using it
 
-The fork publishes only `akit-java`. In a robot project's `vendordeps/AdvantageKit.json`, add the
-repository and change only the `akit-java` version; `akit-wpilibio` and `akit-autolog` stay at the
-upstream version:
+The fork is its own vendordep. In VS Code, "WPILib: Manage Vendor Libraries" > "Install new
+library (online)" with:
 
-```json
-"mavenUrls": [
-  "https://frcmaven.wpi.edu/artifactory/littletonrobotics-mvn-release/",
-  "https://spectrum3847.github.io/AdvantageKit/"
-],
-"javaDependencies": [
-  { "groupId": "org.littletonrobotics.akit", "artifactId": "akit-java", "version": "27.0.0-alpha-7-spectrum.1" }
-]
 ```
+https://spectrum3847.github.io/AdvantageKit/AdvantageKit-Spectrum.json
+```
+
+and delete `vendordeps/AdvantageKit.json` (the two conflict on purpose). Its `jsonUrl` is that
+address, so "Check for updates" moves to the fork's next version, never back to upstream. Every
+published version's file is also kept under `vendordeps/` on the site.
+
+It brings `akit-java` and `akit-autolog` from this fork and the native `akit-wpilibio` from
+upstream, at the upstream version the fork version starts with. A `build.gradle` that reads the
+AdvantageKit version for the annotation processor must read `AdvantageKit-Spectrum.json`.
 
 ## Publishing
 
 ```bash
-spectrum/publish_maven.sh 27.0.0-alpha-7-spectrum.2
+spectrum/publish_maven.sh 27.0.0-alpha-7-spectrum.3
 ```
 
-Builds and tests `akit-java` from the current commit and pushes it to the `maven` branch, which
-GitHub Pages serves. Versions end in `-spectrum.N` and are never overwritten.
+Builds and tests the fork from the current commit and pushes `akit-java`, `akit-autolog` and the
+vendordep (from `spectrum/AdvantageKit-Spectrum.json`) to the `maven` branch, which GitHub Pages
+serves. Versions end in `-spectrum.N` and are never overwritten.
